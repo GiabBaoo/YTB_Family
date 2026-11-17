@@ -21,19 +21,22 @@ class BackgroundAudioService {
   window.__ytbFamilyBgAudioActive = true;
   window.__ytbAppInBackground = false;
   window.__ytbUserCommandAt = 0;
+  window.__ytbSystemPausedAt = 0;
 
   const USER_INTERACTION_WINDOW_MS = 1000;
-  const RESUME_DELAYS = [50, 150, 300, 600, 1000, 2000];
+  const SYSTEM_PAUSE_WINDOW_MS = 2000;
+  const RESUME_DELAYS = [150, 300, 600, 1000, 2000];
   const MAX_RESUME_ATTEMPTS = RESUME_DELAYS.length;
   const RESUME_WINDOW_MS = 10000;
-  const BACKGROUND_FRAME_MS = 100;
+  const BACKGROUND_FRAME_STEADY_MS = 250;
+  const BACKGROUND_FRAME_TRANSITION_MS = 100;
   const WATCHDOG_INTERVAL_MS = 1000;
   let lastPlayerInteractionAt = 0;
   let wasPlayingBeforeEnded = false;
   let watchdogTimer = null;
 
   function markUserInteraction(e) {
-    if (window.__ytbAppInBackground === true) return;
+    if (e && e.isTrusted === false) return;
     if (e && e.type === 'keydown') {
       const k = e.key;
       if (k !== ' ' && k !== 'k' && k !== 'K' &&
@@ -45,12 +48,12 @@ class BackgroundAudioService {
   }
 
   function hasRecentUserCommand() {
-    return (Date.now() - (window.__ytbUserCommandAt || 0)) < USER_INTERACTION_WINDOW_MS;
+    return (Date.now() - (window.__ytbUserCommandAt || 0)) < USER_INTERACTION_WINDOW_MS ||
+      (Date.now() - (window.__ytbSystemPausedAt || 0)) < SYSTEM_PAUSE_WINDOW_MS;
   }
 
   function isUserPause() {
     if (hasRecentUserCommand()) return true;
-    if (window.__ytbAppInBackground === true) return false;
     return (Date.now() - lastPlayerInteractionAt) < USER_INTERACTION_WINDOW_MS;
   }
 
@@ -98,7 +101,7 @@ class BackgroundAudioService {
     window.addEventListener(evt, blockEvent, true);
   }
 
-  for (const evt of ['pointerdown', 'keydown']) {
+  for (const evt of ['pointerdown', 'touchend', 'click', 'keydown']) {
     document.addEventListener(evt, markUserInteraction, { capture: true, passive: true });
   }
 
@@ -181,29 +184,40 @@ class BackgroundAudioService {
     }
   }, true);
 
-  // Pause do Chromium tự gây ra (không qua JS .pause()) khi tắt màn hình.
+  // Pause do Chromium tự gây ra (không qua JS .pause()) khi tắt màn hình hoặc mất audio focus.
   document.addEventListener('pause', function(e) {
     const v = e.target;
     if (!isProtectedVideo(v) || v.ended || !v.__ytbShouldPlay) return;
-    if (window.__ytbAppInBackground === true && !hasRecentUserCommand()) {
-      tryResume(v);
+    if (window.__ytbAppInBackground === true && !isUserPause() && !v.__ytbPausedByCall) {
+      const bridge = window.flutter_inappwebview;
+      if (bridge && typeof bridge.callHandler === 'function') {
+        bridge.callHandler('ytbPauseCheck').then(function(otherActive) {
+          if (otherActive === true) {
+            window.__ytbSystemPause('focus', false);
+          } else {
+            tryResume(v);
+          }
+        }).catch(function() {
+          tryResume(v);
+        });
+      } else {
+        tryResume(v);
+      }
     }
   }, true);
 
   const origPause = HTMLMediaElement.prototype.pause;
   HTMLMediaElement.prototype.pause = function() {
     if (window.__ytbAppInBackground !== true) {
-      if (this.tagName === 'VIDEO' && (this.ended || isUserPause())) {
+      if (this.tagName === 'VIDEO') {
         this.__ytbShouldPlay = false;
-        if (isUserPause()) {
-          wasPlayingBeforeEnded = false;
-          this.__ytbWasPlayingBeforeEnded = false;
-        }
+        wasPlayingBeforeEnded = false;
+        this.__ytbWasPlayingBeforeEnded = false;
       }
       return origPause.apply(this, arguments);
     }
-    // Ở nền: chặn pause hệ thống nếu không phải lệnh từ người dùng (Notification/Lockscreen).
-    if (!hasRecentUserCommand() && isProtectedVideo(this) && !this.ended && this.__ytbShouldPlay) {
+    // Ở nền: chặn pause hệ thống nếu không phải lệnh từ người dùng (Notification/Lockscreen/chạm trực tiếp).
+    if (!isUserPause() && isProtectedVideo(this) && !this.ended && this.__ytbShouldPlay) {
       return;
     }
     if (this.tagName === 'VIDEO' && (this.ended || isUserPause())) {
@@ -263,6 +277,41 @@ class BackgroundAudioService {
       watchdogTimer = null;
     }
   }
+
+  window.__ytbSystemPause = function(reason, canResumeLater) {
+    window.__ytbSystemPausedAt = Date.now();
+    window.__ytbUserCommandAt = Date.now();
+    wasPlayingBeforeEnded = false;
+    document.querySelectorAll('video').forEach(function(v) {
+      if (!isProtectedVideo(v)) return;
+      if (v.__ytbResumeTimer) {
+        clearTimeout(v.__ytbResumeTimer);
+        v.__ytbResumeTimer = null;
+      }
+      v.__ytbWasPlayingBeforeEnded = false;
+      v.__ytbPausedByCall = !!canResumeLater && (!v.paused || v.__ytbShouldPlay);
+      v.__ytbShouldPlay = false;
+      if (!v.paused) {
+        try { origPause.call(v); } catch (_) {}
+      }
+    });
+    if (!canResumeLater) stopWatchdog();
+  };
+
+  window.__ytbSystemResume = function(reason) {
+    window.__ytbSystemPausedAt = 0;
+    document.querySelectorAll('video').forEach(function(v) {
+      if (!isProtectedVideo(v) || !v.__ytbPausedByCall) return;
+      v.__ytbPausedByCall = false;
+      v.__ytbShouldPlay = true;
+      if (v.paused && !v.ended) {
+        v.play().catch(function() {});
+      }
+    });
+    if (window.__ytbAppInBackground === true && hasProtectedPlayback()) {
+      startWatchdog();
+    }
+  };
 
   window.__ytbSetBackground = function(background) {
     window.__ytbAppInBackground = background === true;
@@ -330,10 +379,13 @@ class BackgroundAudioService {
     window.requestAnimationFrame = function(callback) {
       if (window.__ytbAppInBackground === true && watchdogTimer !== null) {
         const id = 1000000000 + (++shimSeq);
+        const frameMs = wasPlayingBeforeEnded
+          ? BACKGROUND_FRAME_TRANSITION_MS
+          : BACKGROUND_FRAME_STEADY_MS;
         const timer = setTimeout(function() {
           shimTimers.delete(id);
           callback(performance.now());
-        }, BACKGROUND_FRAME_MS);
+        }, frameMs);
         shimTimers.set(id, timer);
         return id;
       }

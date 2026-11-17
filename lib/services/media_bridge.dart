@@ -31,6 +31,27 @@ class MediaBridge {
   let cachedUrlId = '';
   let cachedDocTitle = '';
   let cachedMeta = null;
+  const artCache = new Map();
+
+  function resolveArtwork(id) {
+    if (!id) return '';
+    const cached = artCache.get(id);
+    if (cached) return cached;
+    const hq = 'https://i.ytimg.com/vi/' + id + '/hqdefault.jpg';
+    const maxres = 'https://i.ytimg.com/vi/' + id + '/maxresdefault.jpg';
+    artCache.set(id, hq);
+    try {
+      const img = new Image();
+      img.onload = function() {
+        if (img.naturalWidth > 120) {
+          artCache.set(id, maxres);
+          schedule(true);
+        }
+      };
+      img.src = maxres;
+    } catch (_) {}
+    return hq;
+  }
 
   const ms = navigator.mediaSession;
   if (ms && typeof ms.setActionHandler === 'function') {
@@ -44,7 +65,12 @@ class MediaBridge {
   function mainVideo() {
     return document.querySelector('#movie_player video.html5-main-video') ||
       document.querySelector('.html5-video-player video') ||
-      document.querySelector('video.html5-main-video');
+      document.querySelector('#shorts-player video, ytm-shorts-player video') ||
+      document.querySelector('video.html5-main-video') ||
+      Array.from(document.querySelectorAll('video')).find(function(v) {
+        return !v.muted && (v.currentSrc || v.src) && v.duration > 0;
+      }) ||
+      null;
   }
 
   function player() {
@@ -106,10 +132,12 @@ class MediaBridge {
       cachedMeta = { id: id, title: title, artist: artist };
     }
     const meta = ms ? ms.metadata : null;
-    let art = id ? 'https://i.ytimg.com/vi/' + id + '/hqdefault.jpg' : '';
+    let art = resolveArtwork(id);
     if (!art && meta && meta.artwork && meta.artwork.length) {
       art = meta.artwork[meta.artwork.length - 1].src || '';
     }
+    const isWatchPage = location.pathname.startsWith('/watch') ||
+      location.pathname.startsWith('/shorts');
     return {
       active: true,
       id: id,
@@ -120,7 +148,10 @@ class MediaBridge {
       position: v.currentTime,
       rate: v.playbackRate || 1,
       playing: !v.paused && !v.ended,
-      ended: v.ended
+      ended: v.ended,
+      isWatchPage: isWatchPage,
+      videoWidth: v.videoWidth || 16,
+      videoHeight: v.videoHeight || 9
     };
   }
 
@@ -148,12 +179,21 @@ class MediaBridge {
     post(state);
   }
 
-  function schedule(force) {
+  function schedule(force, immediate) {
     if (force) forceNext = true;
+    if (immediate) {
+      if (sendTimer) {
+        clearTimeout(sendTimer);
+        sendTimer = null;
+      }
+      send();
+      return;
+    }
     if (sendTimer) return;
     sendTimer = setTimeout(send, 250);
   }
 
+  const immediateEvents = { play: true, playing: true, loadedmetadata: true };
   const forceEvents = ['play', 'playing', 'pause', 'ended', 'seeked', 'ratechange', 'durationchange', 'loadedmetadata', 'emptied'];
   for (const evt of forceEvents) {
     document.addEventListener(evt, function(e) {
@@ -162,10 +202,19 @@ class MediaBridge {
       if (t.muted && !t.classList.contains('html5-main-video') && !(t.closest && t.closest('#movie_player'))) {
         return;
       }
-      schedule(true);
+      schedule(true, !!immediateEvents[evt]);
     }, true);
   }
-  window.addEventListener('yt-navigate-finish', function() { schedule(false); });
+  window.addEventListener('yt-navigate-finish', function() { schedule(false, true); });
+
+  setInterval(function() {
+    const v = mainVideo();
+    if (!v) return;
+    const isPlaying = !v.paused && !v.ended && (v.duration > 0) && isFinite(v.duration);
+    if (isPlaying && (!lastState || !lastState.active || !lastState.playing)) {
+      schedule(true, true);
+    }
+  }, 2000);
 
   function callYtHandler(action) {
     const h = handlers[action];

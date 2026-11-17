@@ -1,4 +1,5 @@
 import 'dart:collection';
+import 'dart:convert';
 
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
@@ -72,7 +73,7 @@ class AdBlockService {
       UnmodifiableListView<UserScript>([
         UserScript(
           groupName: 'ytb_family_adblock_start',
-          source: _adBlockStartJs,
+          source: _buildAdBlockStartJs(),
           injectionTime: UserScriptInjectionTime.AT_DOCUMENT_START,
         ),
         UserScript(
@@ -82,22 +83,35 @@ class AdBlockService {
         ),
       ]);
 
-  static const String _adBlockStartJs = r'''
+  static String _buildAdBlockStartJs() {
+    final hostsJson = jsonEncode(_blockedHosts);
+    final pathsJson = jsonEncode(_blockedPathSegments);
+    return _adBlockStartJsTemplate
+        .replaceFirst('__BLOCKED_HOSTS_JSON__', hostsJson)
+        .replaceFirst('__BLOCKED_PATHS_JSON__', pathsJson);
+  }
+
+  static const String _adBlockStartJsTemplate = r'''
 (function() {
   if (window.__ytbFamilyStartActive) return;
   window.__ytbFamilyStartActive = true;
 
-  // 1. Force YouTube Dark Mode (PREF=f6=400) if not already enabled.
+  // 1. Merge Dark Mode (f6=400) vào cookie PREF hiện có để không mất f5/hl/tz.
   try {
-    if (!document.cookie.includes('f6=400')) {
-      document.cookie = 'PREF=f6=400; domain=.youtube.com; path=/; max-age=31536000; SameSite=Lax';
+    const m = document.cookie.match(/(?:^|;\s*)PREF=([^;]*)/);
+    const raw = m ? decodeURIComponent(m[1]) : '';
+    const params = new URLSearchParams(raw);
+    if (params.get('f6') !== '400') {
+      params.set('f6', '400');
+      document.cookie = 'PREF=' + params.toString() +
+        '; domain=.youtube.com; path=/; max-age=31536000; SameSite=Lax';
     }
   } catch (_) {}
 
   // 2. Inject Ad-Block & Native YouTube Look & Feel CSS immediately.
   const STYLE_ID = 'ytb-family-style';
   const COMBINED_CSS = `
-    /* Feed, banner & search ads */
+    /* Feed, banner, search & merch ads */
     ytm-promoted-sparkles-web-renderer,
     ytm-promoted-sparkles-text-search-renderer,
     ytm-promoted-video-renderer,
@@ -110,6 +124,11 @@ class AdBlockService {
     ytm-brand-video-shelf-renderer,
     ytm-banner-promo-renderer,
     ytm-statement-banner-renderer,
+    ytm-merch-shelf-renderer,
+    ytm-product-carousel-renderer,
+    ytm-shopping-carousel-renderer,
+    ytm-enforcement-message-view-model,
+    ytd-enforcement-message-view-model,
     #masthead-ad,
     .ytp-ad-overlay-container,
     .ytp-ad-image-overlay,
@@ -132,7 +151,7 @@ class AdBlockService {
     }
 
     /* Ẩn triệt để thẻ cha chứa quảng cáo để tránh khoảng trống & layout shift */
-    ytm-rich-item-renderer:has(> ytm-ad-slot-renderer, > ytm-promoted-sparkles-web-renderer, > ytm-in-feed-ad-layout-renderer),
+    ytm-rich-item-renderer:has(> ytm-ad-slot-renderer, > ytm-promoted-sparkles-web-renderer, > ytm-in-feed-ad-layout-renderer, > ytm-promoted-video-renderer),
     ytm-item-section-renderer > ytm-ad-slot-renderer,
     ytm-item-section-renderer > ytm-promoted-sparkles-web-renderer {
       display: none !important;
@@ -182,7 +201,52 @@ class AdBlockService {
       backdrop-filter: none !important;
       -webkit-backdrop-filter: none !important;
     }
+
+    /* PiP full-viewport player */
+    html.ytb-pip-mode ytm-mobile-topbar-renderer,
+    html.ytb-pip-mode ytm-pivot-bar-renderer,
+    html.ytb-pip-mode ytm-watch-metadata,
+    html.ytb-pip-mode ytm-item-section-renderer {
+      display: none !important;
+    }
+    html.ytb-pip-mode #movie_player,
+    html.ytb-pip-mode .html5-video-player {
+      position: fixed !important;
+      inset: 0 !important;
+      width: 100vw !important;
+      height: 100vh !important;
+      z-index: 999998 !important;
+      background: transparent !important;
+    }
+    html.ytb-pip-mode video.html5-main-video,
+    html.ytb-pip-mode #movie_player video {
+      position: fixed !important;
+      inset: 0 !important;
+      width: 100vw !important;
+      height: 100vh !important;
+      z-index: 999999 !important;
+      background: transparent !important;
+      object-fit: contain !important;
+    }
+    html.ytb-pip-mode .player-controls-content,
+    html.ytb-pip-mode .ytp-chrome-top,
+    html.ytb-pip-mode .ytp-chrome-bottom,
+    html.ytb-pip-mode .ytp-gradient-top,
+    html.ytb-pip-mode .ytp-gradient-bottom,
+    html.ytb-pip-mode .ytp-cued-thumbnail-overlay,
+    html.ytb-pip-mode .ytp-pause-overlay,
+    html.ytb-pip-mode .ytp-spinner,
+    html.ytb-pip-mode .ytp-bezel,
+    html.ytb-pip-mode ytm-mobile-topbar-renderer {
+      display: none !important;
+    }
   `;
+
+  window.__ytbSetPip = function(enabled) {
+    try {
+      document.documentElement.classList.toggle('ytb-pip-mode', enabled === true);
+    } catch (_) {}
+  };
 
   function injectHeadAssets() {
     const target = document.head || document.documentElement;
@@ -220,27 +284,9 @@ class AdBlockService {
     }
   });
 
-  // 3. Player Response Pruning & Beacon Ad Blocking.
-  const BLOCKED_HOSTS = [
-    'doubleclick.net',
-    'googlesyndication.com',
-    'googleadservices.com',
-    'google-analytics.com',
-    'googletagmanager.com',
-    'googletagservices.com',
-    'adservice.google.com',
-    '2mdn.net',
-    'ads.youtube.com'
-  ];
-
-  const BLOCKED_PATHS = [
-    '/pagead/',
-    '/api/stats/ads',
-    '/ptracking',
-    '/get_midroll_info',
-    '/youtubei/v1/player/ad_break',
-    '/ad_data_sync'
-  ];
+  // 3. Single-source blocklist & Network/JSON Pruning.
+  const BLOCKED_HOSTS = __BLOCKED_HOSTS_JSON__;
+  const BLOCKED_PATHS = __BLOCKED_PATHS_JSON__;
 
   function isBlockedBeaconUrl(rawUrl) {
     if (!rawUrl || typeof rawUrl !== 'string') return false;
@@ -261,24 +307,92 @@ class AdBlockService {
     return false;
   }
 
+  const FEED_AD_KEYS = [
+    'adSlotRenderer',
+    'promotedSparklesWebRenderer',
+    'promotedSparklesTextSearchRenderer',
+    'inFeedAdLayoutRenderer',
+    'promotedVideoRenderer',
+    'searchPyvRenderer',
+    'brandVideoShelfRenderer',
+    'bannerPromoRenderer',
+    'statementBannerRenderer',
+    'merchandiseShelfRenderer',
+    'productCarouselRenderer'
+  ];
+
+  function isAdRenderer(obj) {
+    if (!obj || typeof obj !== 'object') return false;
+    for (let i = 0; i < FEED_AD_KEYS.length; i++) {
+      if (obj[FEED_AD_KEYS[i]] !== undefined) return true;
+    }
+    const ep = obj.engagementPanelSectionListRenderer;
+    if (ep && typeof ep.panelIdentifier === 'string') {
+      const id = ep.panelIdentifier.toLowerCase();
+      if (id.includes('ads') || id.includes('shopping')) return true;
+    }
+    return false;
+  }
+
   function prunePlayerAds(data, depth) {
-    if (!data || typeof data !== 'object' || (depth || 0) > 4) return data;
+    if (!data || typeof data !== 'object' || (depth || 0) > 6) return data;
     if (Array.isArray(data)) {
-      for (let i = 0; i < data.length; i++) {
-        prunePlayerAds(data[i], (depth || 0) + 1);
+      for (let i = data.length - 1; i >= 0; i--) {
+        if (isAdRenderer(data[i])) {
+          data.splice(i, 1);
+        } else {
+          prunePlayerAds(data[i], (depth || 0) + 1);
+        }
       }
       return data;
     }
     delete data.adPlacements;
     delete data.playerAds;
     delete data.adSlots;
+    delete data.adBreakHeartbeatParams;
     if (data.playerResponse && typeof data.playerResponse === 'object') {
       prunePlayerAds(data.playerResponse, (depth || 0) + 1);
+    }
+    if (Array.isArray(data.engagementPanels)) {
+      prunePlayerAds(data.engagementPanels, (depth || 0) + 1);
     }
     return data;
   }
 
-  // Prune ytInitialPlayerResponse as soon as YouTube assigns it.
+  function pruneFeedAds(data, depth) {
+    const d = depth || 0;
+    if (!data || typeof data !== 'object' || d > 12) return data;
+    if (Array.isArray(data)) {
+      for (let i = data.length - 1; i >= 0; i--) {
+        const item = data[i];
+        if (isAdRenderer(item)) {
+          data.splice(i, 1);
+        } else {
+          pruneFeedAds(item, d + 1);
+        }
+      }
+      return data;
+    }
+    delete data.adPlacements;
+    delete data.playerAds;
+    delete data.adSlots;
+    delete data.adBreakHeartbeatParams;
+    const keys = Object.keys(data);
+    for (let i = 0; i < keys.length; i++) {
+      const k = keys[i];
+      const v = data[k];
+      if (v && typeof v === 'object') {
+        if (isAdRenderer(v)) {
+          delete data[k];
+        } else {
+          pruneFeedAds(v, d + 1);
+        }
+      }
+    }
+    return data;
+  }
+
+  // Prune ytInitialPlayerResponse & ytInitialData as soon as YouTube assigns them.
   let _ytInitialPlayerResponse = prunePlayerAds(window.ytInitialPlayerResponse, 0);
   try {
     Object.defineProperty(window, 'ytInitialPlayerResponse', {
@@ -286,6 +400,16 @@ class AdBlockService {
       enumerable: true,
       get: function() { return _ytInitialPlayerResponse; },
       set: function(val) { _ytInitialPlayerResponse = prunePlayerAds(val, 0); }
+    });
+  } catch (_) {}
+
+  let _ytInitialData = pruneFeedAds(window.ytInitialData, 0);
+  try {
+    Object.defineProperty(window, 'ytInitialData', {
+      configurable: true,
+      enumerable: true,
+      get: function() { return _ytInitialData; },
+      set: function(val) { _ytInitialData = pruneFeedAds(val, 0); }
     });
   } catch (_) {}
 
@@ -325,11 +449,50 @@ class AdBlockService {
       if (url.includes('/youtubei/v1/player') || url.includes('/youtubei/v1/next')) {
         return p.then(function(data) { return prunePlayerAds(data, 0); });
       }
+      if (url.includes('/youtubei/v1/browse') ||
+          url.includes('/youtubei/v1/search') ||
+          url.includes('/youtubei/v1/reel/reel_watch_sequence') ||
+          url.includes('/youtubei/v1/guide')) {
+        return p.then(function(data) { return pruneFeedAds(data, 0); });
+      }
       return p;
     };
   }
 
-  // Wrap navigator.sendBeacon & XMLHttpRequest thay cho Android contentBlockers đồng bộ.
+  // Hook window.fetch chỉ cho URL nằm trong blocklist.
+  if (typeof window.fetch === 'function') {
+    const origFetch = window.fetch.bind(window);
+    window.fetch = function(input, init) {
+      const url = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+      if (url && isBlockedBeaconUrl(url)) {
+        return Promise.resolve(new Response(null, { status: 204 }));
+      }
+      return origFetch(input, init);
+    };
+  }
+
+  // Chặn <img> tracking pixel thuộc blocklist.
+  try {
+    const imgDesc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+    if (imgDesc && imgDesc.set) {
+      Object.defineProperty(HTMLImageElement.prototype, 'src', {
+        configurable: true,
+        enumerable: imgDesc.enumerable,
+        get: imgDesc.get,
+        set: function(val) {
+          if (typeof val === 'string' && isBlockedBeaconUrl(val)) {
+            return imgDesc.set.call(
+              this,
+              'data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7'
+            );
+          }
+          return imgDesc.set.call(this, val);
+        }
+      });
+    }
+  } catch (_) {}
+
+  // Wrap navigator.sendBeacon & XMLHttpRequest.
   if (navigator.sendBeacon) {
     const origSendBeacon = navigator.sendBeacon.bind(navigator);
     navigator.sendBeacon = function(url, data) {
@@ -390,6 +553,83 @@ class AdBlockService {
   let observedPlayer = null;
   let playerObserver = null;
   let timeUpdateVideo = null;
+  let contentReadySent = false;
+  let lastShortsSkipAt = 0;
+
+  // SponsorBlock cache & active segments
+  const sbCache = new Map();
+  let sbCurrentId = '';
+  let sbSegments = [];
+  let sbLastSkipped = -1;
+
+  function currentVideoId() {
+    try {
+      const u = new URL(location.href);
+      const v = u.searchParams.get('v');
+      if (v) return v;
+      const m = u.pathname.match(/^\/shorts\/([\w-]+)/);
+      return m ? m[1] : '';
+    } catch (_) {
+      return '';
+    }
+  }
+
+  function loadSponsorSegments(videoId) {
+    if (!videoId || videoId === sbCurrentId) return;
+    sbCurrentId = videoId;
+    sbLastSkipped = -1;
+    if (sbCache.has(videoId)) {
+      sbSegments = sbCache.get(videoId) || [];
+      return;
+    }
+    sbSegments = [];
+    const ctrl = typeof AbortController === 'function' ? new AbortController() : null;
+    const timer = ctrl ? setTimeout(function() { ctrl.abort(); }, 3000) : null;
+    fetch(
+      'https://sponsor.ajax.sponsorblock.org/api/skipSegments?videoID=' +
+        encodeURIComponent(videoId) +
+        '&categories=["sponsor","selfpromo","interaction"]',
+      ctrl ? { signal: ctrl.signal } : undefined
+    ).then(function(r) {
+      return r.ok ? r.json() : [];
+    }).then(function(list) {
+      if (timer) clearTimeout(timer);
+      const segs = Array.isArray(list)
+        ? list.map(function(s) { return s.segment; }).filter(function(s) {
+            return Array.isArray(s) && s.length === 2 && s[1] > s[0];
+          })
+        : [];
+      sbCache.set(videoId, segs);
+      if (sbCurrentId === videoId) sbSegments = segs;
+    }).catch(function() {
+      if (timer) clearTimeout(timer);
+      sbCache.set(videoId, []);
+    });
+  }
+
+  function checkSponsorSkip(video) {
+    if (!video || !sbSegments.length || video.paused) return;
+    const t = video.currentTime;
+    for (let i = 0; i < sbSegments.length; i++) {
+      const seg = sbSegments[i];
+      if (t >= seg[0] && t < seg[1] - 0.5 && sbLastSkipped !== seg[0]) {
+        sbLastSkipped = seg[0];
+        video.currentTime = seg[1];
+        break;
+      }
+    }
+  }
+
+  function notifyContentReady() {
+    if (contentReadySent) return;
+    if (document.querySelector('ytm-rich-item-renderer, ytm-video-with-context-renderer, #movie_player')) {
+      contentReadySent = true;
+      const bridge = window.flutter_inappwebview;
+      if (bridge && typeof bridge.callHandler === 'function') {
+        bridge.callHandler('ytbContentReady', true);
+      }
+    }
+  }
 
   function onAdTimeUpdate(e) {
     if (!e.target || e.target.tagName !== 'VIDEO') return;
@@ -397,6 +637,7 @@ class AdBlockService {
     if (now - lastTimeUpdateCheck < TIMEUPDATE_THROTTLE_MS) return;
     lastTimeUpdateCheck = now;
     handleInStreamAds();
+    checkSponsorSkip(e.target);
   }
 
   function syncTimeUpdateListener(video, active) {
@@ -432,16 +673,54 @@ class AdBlockService {
       if (btn) btn.click();
     }
 
+    // Xử lý cảnh báo anti-adblock (enforcement-message) & dialog upsell
+    const enforcement = document.querySelectorAll(
+      'ytm-enforcement-message-view-model, ytd-enforcement-message-view-model'
+    );
+    if (enforcement.length > 0) {
+      for (let i = 0; i < enforcement.length; i++) {
+        const dialog = enforcement[i].closest('tp-yt-paper-dialog') || enforcement[i];
+        dialog.style.display = 'none';
+        dialog.remove();
+      }
+      const backdrop = document.querySelector('tp-yt-iron-overlay-backdrop');
+      if (backdrop) backdrop.remove();
+      const v = document.querySelector('#movie_player video.html5-main-video, video');
+      if (v && v.paused && !v.ended) {
+        v.play().catch(function() {});
+      }
+    }
+
     const dialogs = document.querySelectorAll(
       'tp-yt-paper-dialog, ytm-mealbar-promo-renderer, ytm-upsell-dialog-renderer'
     );
     for (let i = 0; i < dialogs.length; i++) {
       const el = dialogs[i];
-      if (el.querySelector('[href*="premium"], ytm-mealbar-promo-renderer, ytm-upsell-dialog-renderer')) {
+      if (el.querySelector('[href*="premium"], ytm-mealbar-promo-renderer, ytm-upsell-dialog-renderer, ytm-enforcement-message-view-model')) {
         el.style.display = 'none';
         el.remove();
         const backdrop = document.querySelector('tp-yt-iron-overlay-backdrop');
         if (backdrop) backdrop.remove();
+      }
+    }
+  }
+
+  function skipShortsAd() {
+    if (!location.pathname.startsWith('/shorts')) return;
+    const now = Date.now();
+    if (now - lastShortsSkipAt < 800) return;
+    const activeReel = document.querySelector('ytm-reel-video-renderer[is-active], ytm-reel-video-renderer');
+    if (!activeReel) return;
+    const hasAd = activeReel.querySelector(
+      'ytm-ad-slot-renderer, ytm-in-feed-ad-layout-renderer, [data-ad-slot], .ytm-reel-ad-badge'
+    );
+    if (hasAd) {
+      lastShortsSkipAt = now;
+      const nextBtn = document.querySelector('.reel-next-button button, button[aria-label="Next video"]');
+      if (nextBtn) {
+        nextBtn.click();
+      } else {
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'ArrowDown', keyCode: 40, bubbles: true }));
       }
     }
   }
@@ -466,10 +745,11 @@ class AdBlockService {
 
   function handleInStreamAds() {
     const player = document.querySelector('#movie_player, .html5-video-player');
-    const isAdShowing = player && (
+    const ssaiOverlay = player && player.querySelector('.ytp-ad-player-overlay, .ytp-ad-preview-container');
+    const isAdShowing = (player && (
       player.classList.contains('ad-showing') ||
       player.classList.contains('ad-interrupting')
-    );
+    )) || (ssaiOverlay && ssaiOverlay.offsetParent !== null);
 
     if (isAdShowing) {
       clickSkipButton();
@@ -500,7 +780,7 @@ class AdBlockService {
         }
       }
     } else {
-      syncTimeUpdateListener(null, false);
+      syncTimeUpdateListener(video, sbSegments.length > 0);
       if (window.__ytbFamilyAdMuted) {
         video.muted = Boolean(window.__ytbFamilyWasMuted);
         try { video.playbackRate = 1; } catch (_) {}
@@ -526,8 +806,12 @@ class AdBlockService {
   }
 
   function onPageOrNavigation() {
+    notifyContentReady();
     dismissPremiumPopups();
+    skipShortsAd();
     attachPlayerObserver();
+    const vid = currentVideoId();
+    if (vid) loadSponsorSegments(vid);
   }
 
   onPageOrNavigation();
@@ -543,8 +827,11 @@ class AdBlockService {
           !(t.closest && t.closest('#movie_player'))) {
         return;
       }
+      notifyContentReady();
       attachPlayerObserver();
       handleInStreamAds();
+      const vid = currentVideoId();
+      if (vid) loadSponsorSegments(vid);
     }, true);
   }
 })();

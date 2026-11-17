@@ -14,18 +14,37 @@ class YtAudioHandler extends BaseAudioHandler {
   static const Duration _idleDebounce = Duration(seconds: 3);
   static const Duration _backgroundIdleDebounce = Duration(seconds: 20);
   static const Duration _userCommandWindow = Duration(seconds: 2);
+  static const List<int> _sleepTimerOptionsMinutes = [0, 15, 30, 60];
 
   MediaCommandSender? commandSender;
 
   Timer? _pauseTimer;
   Timer? _idleTimer;
+  Timer? _sleepTimer;
+  DateTime? _sleepEndsAt;
+  int _sleepOptionIndex = 0;
   DateTime _lastUserPauseAt = DateTime.fromMillisecondsSinceEpoch(0);
   bool _inBackground = false;
+  String _lastArtist = '';
 
   bool get isPlaying => playbackState.value.playing;
+  int get sleepTimerMinutes => _sleepTimerOptionsMinutes[_sleepOptionIndex];
 
   void setBackground(bool inBackground) {
     _inBackground = inBackground;
+  }
+
+  /// Đánh dấu pause từ hệ thống (rút tai nghe / cuộc gọi) để không bị debounce giữ trạng thái playing.
+  void markSystemPaused() {
+    _lastUserPauseAt = DateTime.now();
+    _pauseTimer?.cancel();
+    if (isPlaying) {
+      _pushState(
+        playing: false,
+        position: playbackState.value.position,
+        rate: playbackState.value.speed,
+      );
+    }
   }
 
   static Future<YtAudioHandler> init() {
@@ -66,6 +85,7 @@ class YtAudioHandler extends BaseAudioHandler {
     final id = (data['id'] as String?) ?? '';
     final title = (data['title'] as String?) ?? '';
     final artist = (data['artist'] as String?) ?? '';
+    _lastArtist = artist;
     final art = (data['art'] as String?) ?? '';
     final duration = _seconds(data['duration']);
     final position = _seconds(data['position']) ?? Duration.zero;
@@ -73,17 +93,18 @@ class YtAudioHandler extends BaseAudioHandler {
     final playing = data['playing'] == true;
     final ended = data['ended'] == true;
 
+    final displayArtist = _formatArtistWithTimer(artist);
     final current = mediaItem.value;
     if (current == null ||
         current.id != (id.isEmpty ? 'ytb_family' : id) ||
         current.title != title ||
-        current.artist != artist ||
+        current.artist != displayArtist ||
         current.duration != duration ||
         current.artUri?.toString() != art) {
       mediaItem.add(MediaItem(
         id: id.isEmpty ? 'ytb_family' : id,
         title: title.isEmpty ? 'YouTube' : title,
-        artist: artist,
+        artist: displayArtist,
         artUri: art.isEmpty ? null : Uri.tryParse(art),
         duration: duration,
       ));
@@ -118,6 +139,43 @@ class YtAudioHandler extends BaseAudioHandler {
     });
   }
 
+  String _formatArtistWithTimer(String artist) {
+    final endsAt = _sleepEndsAt;
+    if (endsAt == null) return artist;
+    final remaining = endsAt.difference(DateTime.now());
+    if (remaining.isNegative) return artist;
+    final mins = (remaining.inSeconds / 60).ceil();
+    final badge = '⏱ ${mins}p';
+    return artist.isEmpty ? badge : '$artist • $badge';
+  }
+
+  void _refreshArtistBadge() {
+    final current = mediaItem.value;
+    if (current == null) return;
+    mediaItem.add(current.copyWith(artist: _formatArtistWithTimer(_lastArtist)));
+  }
+
+  /// Xoay vòng hẹn giờ tắt: Tắt -> 15p -> 30p -> 60p -> Tắt.
+  void cycleSleepTimer() {
+    _sleepTimer?.cancel();
+    _sleepTimer = null;
+    _sleepOptionIndex = (_sleepOptionIndex + 1) % _sleepTimerOptionsMinutes.length;
+    final minutes = sleepTimerMinutes;
+    if (minutes <= 0) {
+      _sleepEndsAt = null;
+    } else {
+      _sleepEndsAt = DateTime.now().add(Duration(minutes: minutes));
+      _sleepTimer = Timer(Duration(minutes: minutes), () {
+        _sleepOptionIndex = 0;
+        _sleepEndsAt = null;
+        _sleepTimer = null;
+        pause();
+        _refreshArtistBadge();
+      });
+    }
+    _refreshArtistBadge();
+  }
+
   void _pushState({
     required bool playing,
     required Duration position,
@@ -130,7 +188,14 @@ class YtAudioHandler extends BaseAudioHandler {
         playing ? MediaControl.pause : MediaControl.play,
         MediaControl.skipToNext,
       ],
-      systemActions: const {MediaAction.seek},
+      systemActions: const {
+        MediaAction.play,
+        MediaAction.pause,
+        MediaAction.playPause,
+        MediaAction.skipToNext,
+        MediaAction.skipToPrevious,
+        MediaAction.seek,
+      },
       androidCompactActionIndices: const [0, 1, 2],
       processingState: processingState,
       playing: playing,
@@ -178,7 +243,35 @@ class YtAudioHandler extends BaseAudioHandler {
       _send('seek', position.inMilliseconds / 1000.0);
 
   @override
+  Future<void> rewind() {
+    final target = playbackState.value.position - const Duration(seconds: 10);
+    return seek(target < Duration.zero ? Duration.zero : target);
+  }
+
+  @override
+  Future<void> fastForward() {
+    final duration = mediaItem.value?.duration;
+    var target = playbackState.value.position + const Duration(seconds: 10);
+    if (duration != null && target > duration) {
+      target = duration;
+    }
+    return seek(target);
+  }
+
+  @override
+  Future<dynamic> customAction(String name, [Map<String, dynamic>? extras]) async {
+    if (name == 'sleepTimer') {
+      cycleSleepTimer();
+      return sleepTimerMinutes;
+    }
+    return super.customAction(name, extras);
+  }
+
+  @override
   Future<void> stop() async {
+    _sleepTimer?.cancel();
+    _sleepTimer = null;
+    _sleepEndsAt = null;
     await pause();
     _goIdle();
     await super.stop();

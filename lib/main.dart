@@ -1,12 +1,53 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 
 import 'screens/home_screen.dart';
 import 'services/media_session_service.dart';
 
 const Color kYouTubeDarkBackground = Color(0xFF0F0F0F);
+const MethodChannel _kLifecycleChannel =
+    MethodChannel('com.example.ytb_family/lifecycle');
 
-void main() {
+Future<void> _ensureYouTubeDarkPrefCookie() async {
+  try {
+    final cm = CookieManager.instance();
+    final ytUrl = WebUri('https://m.youtube.com');
+    final cookies = await cm
+        .getCookies(url: ytUrl)
+        .timeout(const Duration(milliseconds: 250));
+    String existingPref = '';
+    for (final c in cookies) {
+      if (c.name == 'PREF' && c.value != null) {
+        existingPref = c.value.toString();
+        break;
+      }
+    }
+    final parts = existingPref
+        .split('&')
+        .where((p) => p.isNotEmpty && !p.startsWith('f6='))
+        .toList();
+    parts.add('f6=400');
+    final mergedPref = parts.join('&');
+    if (mergedPref != existingPref) {
+      await cm
+          .setCookie(
+            url: ytUrl,
+            name: 'PREF',
+            value: mergedPref,
+            domain: '.youtube.com',
+            path: '/',
+            isSecure: true,
+          )
+          .timeout(const Duration(milliseconds: 250));
+    }
+  } catch (e) {
+    // ignore: avoid_print
+    print('Failed to set PREF dark cookie: $e');
+  }
+}
+
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
   SystemChrome.setSystemUIOverlayStyle(
@@ -22,20 +63,37 @@ void main() {
   final audioHandlerFuture = YtAudioHandler.init()
       .then<YtAudioHandler?>((handler) => handler)
       .catchError((Object e, StackTrace st) {
-    debugPrint('YtAudioHandler.init failed: $e\n$st');
+    final msg = 'YtAudioHandler.init failed: $e\n$st';
+    // ignore: avoid_print
+    print(msg);
+    _kLifecycleChannel.invokeMethod<void>('logError', msg).catchError((_) {});
     return null;
   });
 
-  runApp(YtFamilyApp(audioHandlerFuture: audioHandlerFuture));
+  await _ensureYouTubeDarkPrefCookie();
+
+  String? initialUserAgent;
+  try {
+    initialUserAgent = await _kLifecycleChannel
+        .invokeMethod<String>('getDefaultUserAgent')
+        .timeout(const Duration(milliseconds: 250));
+  } catch (_) {}
+
+  runApp(YtFamilyApp(
+    initialUserAgent: initialUserAgent,
+    audioHandlerFuture: audioHandlerFuture,
+  ));
 }
 
 class YtFamilyApp extends StatelessWidget {
   const YtFamilyApp({
     super.key,
+    this.initialUserAgent,
     this.audioHandler,
     this.audioHandlerFuture,
   });
 
+  final String? initialUserAgent;
   final YtAudioHandler? audioHandler;
   final Future<YtAudioHandler?>? audioHandlerFuture;
 
@@ -52,6 +110,7 @@ class YtFamilyApp extends StatelessWidget {
         ),
       ),
       home: HomeScreen(
+        initialUserAgent: initialUserAgent,
         audioHandler: audioHandler,
         audioHandlerFuture: audioHandlerFuture,
       ),

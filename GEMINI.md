@@ -1,7 +1,7 @@
 # Project: YT Family (Personal Ad-Free YouTube Client for Android)
 
 ## Tech Stack & Packages
-- Flutter (Dart), target platform: Android (minSdk 24, targetSdk 34).
+- Flutter (Dart), target platform: Android (minSdk 24, targetSdk 36).
 - `flutter_inappwebview: ^6.1.5` (Core browser, network ad-blocking, JS injection).
 - `audio_service: ^0.18.18` (Keep audio alive + MediaStyle notification & lockscreen controls).
 - `wakelock_plus: ^1.2.8` (Prevent screen timeout while watching video).
